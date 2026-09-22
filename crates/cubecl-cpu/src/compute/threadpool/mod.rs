@@ -86,6 +86,12 @@ impl Threadpool {
             self.scheduler.ensure_workers(cube_dim.num_elems() as usize);
         }
 
+        // One task per unit position. Each task loops over the launch's whole
+        // `cube_count` inside the compiled entry point, so parallelism is
+        // `cube_dim.num_elems()`, never the cube count, and a unit task is
+        // too coarse to be the grain a work-stealing scheduler steals. The
+        // stealable grain is a cube range, which the kernel ABI cannot express
+        // yet.
         let mut i = 0;
         for unit_pos_x in 0..cube_dim.x {
             for unit_pos_y in 0..cube_dim.y {
