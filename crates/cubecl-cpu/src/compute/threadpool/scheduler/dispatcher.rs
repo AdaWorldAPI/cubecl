@@ -61,12 +61,20 @@ impl DispatcherScheduler {
 
     pub fn send(&mut self, index: usize, task: ComputeTask) {
         let needs_parallelism = task.pliron_engine.requirements().needs_parallelism;
-        let core_workers = self.cores.len().min(self.lens.len());
-        let target = select_target(needs_parallelism, index, core_workers, |i| {
-            self.lens[i].load(atomic::Ordering::Relaxed)
-        });
+        let target = self.target_for(needs_parallelism, index);
         let _ = self.tx[target].send(task);
         self.lens[target].fetch_add(1, atomic::Ordering::Relaxed);
+    }
+}
+
+impl DispatcherScheduler {
+    /// The worker unit `index` goes to. Only the first `cores.len()` workers
+    /// are eligible for ordinary units; see [`select_target`].
+    fn target_for(&self, needs_parallelism: bool, index: usize) -> usize {
+        let core_workers = self.cores.len().min(self.lens.len());
+        select_target(needs_parallelism, index, core_workers, |i| {
+            self.lens[i].load(atomic::Ordering::Relaxed)
+        })
     }
 }
 
@@ -189,7 +197,10 @@ impl Worker for DispatcherWorker {
 
 #[cfg(test)]
 mod tests {
-    use super::select_target;
+    use super::{DispatcherScheduler, select_target};
+    use crate::compute::affinity::get_active_cores;
+    use crossbeam_utils::CachePadded;
+    use std::sync::{Arc, atomic::AtomicUsize};
 
     const CORES: usize = 8;
     const WIDE_BARRIER: usize = 64;
@@ -217,10 +228,26 @@ mod tests {
         assert_eq!(select_target(false, 5, CORES, |i| lens[i]), 2);
     }
 
+    /// The pool as it stands after a wide barrier launch: `CORES` core
+    /// workers plus overflow workers, with the given queue lengths. No
+    /// threads are spawned; only the dispatch state exists.
+    fn grown_pool(lens: &[usize]) -> DispatcherScheduler {
+        let core = get_active_cores().next().expect("at least one active core");
+        DispatcherScheduler {
+            cores: vec![core; CORES],
+            tx: Vec::new(),
+            lens: lens
+                .iter()
+                .map(|&n| Arc::new(CachePadded::new(AtomicUsize::new(n))))
+                .collect(),
+        }
+    }
+
     /// After a wide barrier launch grew the pool to 64 workers, ordinary work
-    /// must stay on the 8 core workers. The overflow workers are made strictly
-    /// idler than every core worker, so a scan over the whole pool would pick
-    /// one of them.
+    /// must stay on the 8 core workers. Driven through the scheduler's own
+    /// dispatch path, so it pins the bound `send` uses, not only the helper.
+    /// The overflow workers are made strictly idler than every core worker,
+    /// so a scan over the whole pool would pick one of them.
     #[test]
     fn ordinary_units_never_land_on_overflow_workers() {
         let lens: Vec<usize> = (0..WIDE_BARRIER)
@@ -232,12 +259,17 @@ mod tests {
                 .all(|&o| lens[..CORES].iter().all(|&c| o < c)),
             "fixture: every overflow worker must be idler than every core worker"
         );
+        let pool = grown_pool(&lens);
         for index in 0..WIDE_BARRIER {
-            let target = select_target(false, index, CORES, |i| lens[i]);
+            let target = pool.target_for(false, index);
             assert!(
                 target < CORES,
                 "unit {index} dispatched to overflow worker {target}"
             );
+        }
+        // Overflow workers still serve their purpose: barrier units reach them.
+        for index in 0..WIDE_BARRIER {
+            assert_eq!(pool.target_for(true, index), index);
         }
     }
 
