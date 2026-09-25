@@ -45,6 +45,10 @@ impl DispatcherScheduler {
     /// count round-robin over the active cores, so a cube with more units than
     /// cores still gets one thread per unit — required so the `sync_cube` spin
     /// barrier never queues two units of the same cube behind each other.
+    ///
+    /// Overflow workers are never shrunk, so they must stay reserved for
+    /// barrier units: [`select_target`] keeps ordinary work on the first
+    /// `cores.len()` workers.
     pub fn ensure_workers(&mut self, n: usize) {
         while self.tx.len() < n {
             let core_id = self.cores[self.tx.len() % self.cores.len()];
@@ -56,28 +60,60 @@ impl DispatcherScheduler {
     }
 
     pub fn send(&mut self, index: usize, task: ComputeTask) {
-        let target = if task.pliron_engine.requirements().needs_parallelism {
-            // Barrier kernels need one dedicated worker per unit; the caller
-            // grew the pool via `ensure_workers` so `index` is in range.
-            index
-        } else {
-            // Independent units load-balance onto the least-loaded worker. The
-            // incoming `index` is a unit position that can exceed the worker
-            // count, so never use it directly here.
-            let mut best = 0;
-            let mut min_value = self.lens[0].load(atomic::Ordering::Relaxed);
-            for i in 1..self.lens.len() {
-                let len = self.lens[i].load(atomic::Ordering::Relaxed);
-                if len < min_value {
-                    best = i;
-                    min_value = len;
-                }
-            }
-            best
-        };
+        let needs_parallelism = task.pliron_engine.requirements().needs_parallelism;
+        let target = self.target_for(needs_parallelism, index);
         let _ = self.tx[target].send(task);
         self.lens[target].fetch_add(1, atomic::Ordering::Relaxed);
     }
+}
+
+impl DispatcherScheduler {
+    /// The worker unit `index` goes to. Only the first `cores.len()` workers
+    /// are eligible for ordinary units; see [`select_target`].
+    fn target_for(&self, needs_parallelism: bool, index: usize) -> usize {
+        let core_workers = self.cores.len().min(self.lens.len());
+        select_target(needs_parallelism, index, core_workers, |i| {
+            self.lens[i].load(atomic::Ordering::Relaxed)
+        })
+    }
+}
+
+/// Chooses the worker a unit is dispatched to.
+///
+/// * Barrier units (`needs_parallelism`) are affine: unit `index` always runs
+///   on worker `index`, one worker per unit, so the `sync_cube` spin barrier
+///   never finds two units of one cube queued behind each other. The caller
+///   grew the pool via [`DispatcherScheduler::ensure_workers`], so `index` is
+///   in range.
+/// * Ordinary units load-balance onto the least-loaded of the first
+///   `core_workers` workers, lowest index on a tie. `index` is a unit
+///   position that can exceed the worker count, so it is never used here.
+///   Overflow workers, spawned for a barrier cube wider than the core count,
+///   are excluded: the pool never shrinks, so counting them would let one
+///   wide barrier launch turn every later ordinary launch into more threads
+///   than cores.
+///
+/// `len_of(i)` reports worker `i`'s queued-task count. Kept free of any task
+/// or channel type so the policy is testable without compiling a kernel.
+fn select_target(
+    needs_parallelism: bool,
+    index: usize,
+    core_workers: usize,
+    len_of: impl Fn(usize) -> usize,
+) -> usize {
+    if needs_parallelism {
+        return index;
+    }
+    let mut best = 0;
+    let mut min_value = len_of(0);
+    for i in 1..core_workers {
+        let len = len_of(i);
+        if len < min_value {
+            best = i;
+            min_value = len;
+        }
+    }
+    best
 }
 
 pub struct DispatcherWorker {
@@ -156,5 +192,91 @@ impl Worker for DispatcherWorker {
                 }
             });
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DispatcherScheduler, select_target};
+    use crate::compute::affinity::get_active_cores;
+    use crossbeam_utils::CachePadded;
+    use std::sync::{Arc, atomic::AtomicUsize};
+
+    const CORES: usize = 8;
+    const WIDE_BARRIER: usize = 64;
+
+    /// A barrier unit runs on its own worker, however the load looks. Worker
+    /// 0 is the least loaded here, so a policy that load-balanced barrier
+    /// units would pick it instead.
+    #[test]
+    fn barrier_units_stay_on_their_own_worker() {
+        let lens: Vec<usize> = (0..WIDE_BARRIER).map(|i| i + 1).collect();
+        for index in 0..WIDE_BARRIER {
+            assert_eq!(
+                select_target(true, index, CORES, |i| lens[i]),
+                index,
+                "barrier unit {index} must not move"
+            );
+        }
+    }
+
+    /// The silence half: an ordinary unit is never pinned to the worker its
+    /// position names. Unit 5 goes to the least-loaded core worker, 2.
+    #[test]
+    fn ordinary_units_ignore_their_unit_position() {
+        let lens = [4, 4, 0, 4, 4, 4, 4, 4];
+        assert_eq!(select_target(false, 5, CORES, |i| lens[i]), 2);
+    }
+
+    /// The pool as it stands after a wide barrier launch: `CORES` core
+    /// workers plus overflow workers, with the given queue lengths. No
+    /// threads are spawned; only the dispatch state exists.
+    fn grown_pool(lens: &[usize]) -> DispatcherScheduler {
+        let core = get_active_cores().next().expect("at least one active core");
+        DispatcherScheduler {
+            cores: vec![core; CORES],
+            tx: Vec::new(),
+            lens: lens
+                .iter()
+                .map(|&n| Arc::new(CachePadded::new(AtomicUsize::new(n))))
+                .collect(),
+        }
+    }
+
+    /// After a wide barrier launch grew the pool to 64 workers, ordinary work
+    /// must stay on the 8 core workers. Driven through the scheduler's own
+    /// dispatch path, so it pins the bound `send` uses, not only the helper.
+    /// The overflow workers are made strictly idler than every core worker,
+    /// so a scan over the whole pool would pick one of them.
+    #[test]
+    fn ordinary_units_never_land_on_overflow_workers() {
+        let lens: Vec<usize> = (0..WIDE_BARRIER)
+            .map(|i| if i < CORES { 3 } else { 0 })
+            .collect();
+        assert!(
+            lens[CORES..]
+                .iter()
+                .all(|&o| lens[..CORES].iter().all(|&c| o < c)),
+            "fixture: every overflow worker must be idler than every core worker"
+        );
+        let pool = grown_pool(&lens);
+        for index in 0..WIDE_BARRIER {
+            let target = pool.target_for(false, index);
+            assert!(
+                target < CORES,
+                "unit {index} dispatched to overflow worker {target}"
+            );
+        }
+        // Overflow workers still serve their purpose: barrier units reach them.
+        for index in 0..WIDE_BARRIER {
+            assert_eq!(pool.target_for(true, index), index);
+        }
+    }
+
+    /// Least loaded wins; the lowest index breaks ties.
+    #[test]
+    fn ordinary_units_pick_the_least_loaded_core_worker() {
+        let lens = [2, 1, 3, 1, 5, 9, 1, 2];
+        assert_eq!(select_target(false, 0, CORES, |i| lens[i]), 1);
     }
 }
